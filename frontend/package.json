@@ -1,0 +1,491 @@
+import base64
+import math
+import os
+import re
+from typing import Any, Dict, List, Tuple
+
+import cv2
+import numpy as np
+import pytesseract
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
+from skimage.feature import peak_local_max
+from skimage.filters import threshold_otsu
+
+
+def normalize_text(value: str) -> str:
+    if value is None:
+        return "Not Detected"
+    cleaned = re.sub(r"\s+", " ", value).strip()
+    return cleaned if cleaned else "Not Detected"
+
+
+def to_base64(image_path: str) -> str:
+    with open(image_path, "rb") as f:
+        encoded = base64.b64encode(f.read()).decode("utf-8")
+    return encoded
+
+
+def save_image(image, path: str) -> None:
+    cv2.imwrite(path, image)
+
+
+def ensure_rgb(image: np.ndarray) -> np.ndarray:
+    if len(image.shape) == 2:
+        return cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+    return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+
+def preprocess_for_ocr(image: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+    resized = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+    enhanced = clahe.apply(resized)
+    blur = cv2.GaussianBlur(enhanced, (3, 3), 0)
+    return blur
+
+
+def detect_cheque_boundary(image: np.ndarray) -> Tuple[np.ndarray, List[Tuple[int, int, int, int]], bool]:
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    edged = cv2.Canny(blur, 50, 200)
+    contours, _ = cv2.findContours(edged, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    max_area = 0
+    candidate = None
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area > max_area and area > (image.shape[0] * image.shape[1] * 0.15):
+            max_area = area
+            candidate = contour
+    if candidate is None:
+        return image, [], False
+    x, y, w, h = cv2.boundingRect(candidate)
+    contour_image = image[y : y + h, x : x + w]
+    return contour_image, [(x, y, w, h)], True
+
+
+def deskew_image(image: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+    coords = np.column_stack(np.where(gray > 0))
+    if len(coords) == 0:
+        return image
+    angle = cv2.minAreaRect(coords)[-1]
+    if angle < -45:
+        angle = 90 + angle
+    elif angle > 45:
+        angle = angle - 90
+    (h, w) = gray.shape[:2]
+    center = (w // 2, h // 2)
+    rot = cv2.getRotationMatrix2D(center, angle, 1.0)
+    rotated = cv2.warpAffine(gray, rot, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+    return rotated
+
+
+def perspective_correct(image: np.ndarray) -> Tuple[np.ndarray, bool]:
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blur, 50, 200)
+    contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return image, False
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)[:10]
+    for contour in contours:
+        perimeter = cv2.arcLength(contour, True)
+        approx = cv2.approxPolyDP(contour, 0.02 * perimeter, True)
+        if len(approx) == 4 and cv2.contourArea(contour) > 1000:
+            points = approx.reshape(4, 2)
+            rect = np.zeros((4, 2), dtype="float32")
+            s = points.sum(axis=1)
+            rect[0] = points[np.argmin(s)]
+            rect[2] = points[np.argmax(s)]
+            diff = np.diff(points, axis=1)
+            rect[1] = points[np.argmin(diff)]
+            rect[3] = points[np.argmax(diff)]
+
+            (tl, tr, br, bl) = rect
+            width = max(np.linalg.norm(br - bl), np.linalg.norm(tr - tl))
+            height = max(np.linalg.norm(tr - br), np.linalg.norm(tl - bl))
+            dst = np.array([[0, 0], [width - 1, 0], [width - 1, height - 1], [0, height - 1]], dtype="float32")
+            matrix = cv2.getPerspectiveTransform(rect, dst)
+            corrected = cv2.warpPerspective(gray, matrix, (int(width), int(height)))
+            return corrected, True
+    return image, False
+
+
+def sharp_and_threshold(image: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+    sharpen = cv2.GaussianBlur(gray, (0, 0), 1.0)
+    sharpen = cv2.addWeighted(gray, 1.6, sharpen, -0.5, 0)
+    _, thresh = cv2.threshold(sharpen, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return thresh
+
+
+def get_ocr_confidence(ocr_data: List[Dict[str, Any]]) -> float:
+    if not ocr_data:
+        return 0.0
+    confidences = [item.get("conf", 0) for item in ocr_data if isinstance(item.get("conf"), (int, float))]
+    if not confidences:
+        return 0.0
+    return round(sum(confidences) / len(confidences), 2)
+
+
+def run_tesseract(image: np.ndarray) -> Dict[str, Any]:
+    processed = preprocess_for_ocr(image)
+    text = pytesseract.image_to_string(processed, config="--psm 6")
+    data = pytesseract.image_to_data(processed, config="--psm 6", output_type=pytesseract.Output.DICT)
+    return {"text": text, "data": data}
+
+
+def extract_field_from_text(text: str, labels: List[str]) -> str:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    for idx, line in enumerate(lines):
+        for label in labels:
+            if label.lower() in line.lower():
+                candidate = line.replace(label, "", 1)
+                return normalize_text(candidate)
+        if idx + 1 < len(lines):
+            combined = f"{lines[idx]} {lines[idx + 1]}"
+            for label in labels:
+                if label.lower() in combined.lower():
+                    candidate = combined.replace(label, "", 1)
+                    return normalize_text(candidate)
+    return "Not Detected"
+
+
+def words_to_number(text: str) -> float:
+    if not text:
+        return 0.0
+    cleaned = text.lower().replace("&", "and").replace("-", " ")
+    cleaned = re.sub(r"[^a-z\s]", "", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if not cleaned or cleaned == "not detected":
+        return 0.0
+
+    ones = {
+        "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+        "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+        "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14,
+        "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18,
+        "nineteen": 19
+    }
+    tens = {
+        "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50,
+        "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90
+    }
+    scales = {"hundred": 100, "thousand": 1000, "lakh": 100000, "million": 1000000}
+
+    total = 0
+    current = 0
+    for word in cleaned.split():
+        if word in ones:
+            current += ones[word]
+        elif word in tens:
+            current += tens[word]
+        elif word == "hundred":
+            current *= 100
+        elif word in scales:
+            if word == "hundred":
+                current *= 100
+            else:
+                total += current * scales[word]
+                current = 0
+        elif word == "and":
+            continue
+        else:
+            if word in {"rupees", "only"}:
+                continue
+    total += current
+    return float(total)
+
+
+def parse_amount_numbers(value: str) -> float:
+    cleaned = normalize_text(value)
+    if cleaned == "Not Detected":
+        return 0.0
+    digits = re.sub(r"[^\d.\,]", "", cleaned)
+    if digits:
+        digits = digits.replace(",", "")
+        try:
+            return float(digits)
+        except ValueError:
+            pass
+    return words_to_number(cleaned)
+
+
+def compare_amounts(number_amount: str, word_amount: str) -> Dict[str, Any]:
+    numeric_value = parse_amount_numbers(number_amount)
+    words_value = words_to_number(word_amount)
+
+    if numeric_value <= 0 and words_value <= 0:
+        return {"match_status": "MISMATCH", "detail": "No numeric amount detected."}
+
+    if numeric_value == 0:
+        return {"match_status": "MISMATCH", "detail": "Numeric amount unavailable, amount in words exists."}
+    if words_value == 0:
+        return {"match_status": "MISMATCH", "detail": "Amount in words unavailable, numeric amount exists."}
+
+    if abs(numeric_value - words_value) < 1:
+        return {"match_status": "MATCH", "detail": "Numbers and words agree."}
+
+    return {"match_status": "MISMATCH", "detail": f"Numeric amount {numeric_value} differs from words amount {words_value}."}
+
+
+def get_signature_region(image: np.ndarray) -> np.ndarray:
+    height, width = image.shape[:2]
+    x = max(0, int(width * 0.55))
+    y = max(0, int(height * 0.45))
+    w = max(50, int(width * 0.35))
+    h = max(40, int(height * 0.2))
+    crop = image[y : y + h, x : x + w]
+    return crop
+
+
+def compare_signatures(signature_crop: np.ndarray, reference_signature: np.ndarray) -> Tuple[float, str]:
+    if signature_crop is None or reference_signature is None:
+        return 0.0, "INVALID / POSSIBLE MISMATCH"
+
+    sig1 = cv2.cvtColor(signature_crop, cv2.COLOR_BGR2GRAY) if len(signature_crop.shape) == 3 else signature_crop
+    sig2 = cv2.cvtColor(reference_signature, cv2.COLOR_BGR2GRAY) if len(reference_signature.shape) == 3 else reference_signature
+
+    if sig1.size == 0 or sig2.size == 0:
+        return 0.0, "INVALID / POSSIBLE MISMATCH"
+
+    sig1 = cv2.resize(sig1, (300, 150))
+    sig2 = cv2.resize(sig2, (300, 150))
+    sig1 = cv2.GaussianBlur(sig1, (5, 5), 0)
+    sig2 = cv2.GaussianBlur(sig2, (5, 5), 0)
+    _, sig1 = cv2.threshold(sig1, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    _, sig2 = cv2.threshold(sig2, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    diff = cv2.absdiff(sig1, sig2)
+    similarity = 100.0 - (np.mean(diff) / 255.0) * 100.0
+    similarity = max(0.0, min(100.0, similarity))
+
+    if similarity >= 85:
+        label = "VALID / MATCH"
+    elif similarity >= 60:
+        label = "SUSPICIOUS"
+    else:
+        label = "INVALID / POSSIBLE MISMATCH"
+    return round(similarity, 2), label
+
+
+def detect_alteration_regions(image: np.ndarray) -> Tuple[List[Dict[str, Any]], str, np.ndarray]:
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    laplacian = cv2.Laplacian(blur, cv2.CV_64F)
+    variance = laplacian.var()
+    threshold_val = 100.0
+    annotated = ensure_rgb(image)
+
+    regions: List[Dict[str, Any]] = []
+    if variance > threshold_val:
+        h, w = gray.shape
+        for x in range(0, w, max(40, w // 6)):
+            for y in range(0, h, max(30, h // 6)):
+                patch = blur[y : y + max(40, h // 6), x : x + max(40, w // 6)]
+                local_var = cv2.Laplacian(patch, cv2.CV_64F).var()
+                if local_var > threshold_val * 1.5:
+                    x1 = max(0, x)
+                    y1 = max(0, y)
+                    x2 = min(w, x + max(40, w // 6))
+                    y2 = min(h, y + max(40, h // 6))
+                    regions.append({
+                        "label": "Possible anomaly",
+                        "x": x1,
+                        "y": y1,
+                        "w": max(20, x2 - x1),
+                        "h": max(20, y2 - y1),
+                    })
+                    cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 0, 255), 2)
+
+    if not regions:
+        status = "No obvious alteration"
+    elif len(regions) <= 3:
+        status = "Possible alteration"
+    else:
+        status = "High-risk alteration"
+
+    return regions, status, cv2.cvtColor(annotated, cv2.COLOR_RGB2BGR)
+
+
+def build_annotated_image(image_path: str, regions: List[Dict[str, Any]]) -> str:
+    img = cv2.imread(image_path)
+    if img is None:
+        return ""
+    annotated = img.copy()
+    for region in regions:
+        x = int(region.get("x", 0))
+        y = int(region.get("y", 0))
+        w = int(region.get("w", 0))
+        h = int(region.get("h", 0))
+        cv2.rectangle(annotated, (x, y), (x + w, y + h), (0, 0, 255), 2)
+        cv2.putText(annotated, region.get("label", "Suspicious"), (x, max(0, y - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+    out_path = image_path.replace(".png", "_annotated.png").replace(".jpg", "_annotated.jpg").replace(".jpeg", "_annotated.jpeg")
+    cv2.imwrite(out_path, annotated)
+    return out_path
+
+
+def calculate_risk_score(result: Dict[str, Any]) -> Dict[str, Any]:
+    score = 0
+    reasons: List[str] = []
+
+    signature_similarity = float(result.get("signature_verification", {}).get("similarity", 0))
+    if signature_similarity < 85:
+        score += 25
+        reasons.append("Signature mismatch risk")
+
+    amount_status = result.get("amount_verification", {}).get("match_status", "MISMATCH")
+    if amount_status == "MISMATCH":
+        score += 25
+        reasons.append("Amount mismatch between numbers and words")
+
+    alteration_status = result.get("alteration_analysis", {}).get("status", "No obvious alteration")
+    if alteration_status == "Possible alteration":
+        score += 20
+        reasons.append("Possible document alteration detected")
+    elif alteration_status == "High-risk alteration":
+        score += 30
+        reasons.append("High-risk alteration indicators detected")
+
+    average_confidence = float(result.get("ocr_summary", {}).get("average_confidence", 0))
+    if average_confidence < 60:
+        score += 10
+        reasons.append("OCR confidence issues")
+
+    if result.get("cheque_validity", {}).get("date_status") == "SUSPICIOUS":
+        score += 10
+        reasons.append("Date irregularity")
+
+    if result.get("cheque_validity", {}).get("micr_status") == "SUSPICIOUS":
+        score += 5
+        reasons.append("MICR anomaly")
+
+    if result.get("cheque_validity", {}).get("other_anomalies"):
+        score += 5
+        reasons.append("Other structural anomalies")
+
+    score = min(score, 100)
+    if score <= 30:
+        level = "LOW"
+    elif score <= 60:
+        level = "MEDIUM"
+    else:
+        level = "HIGH"
+
+    return {"score": score, "level": level, "reasons": reasons}
+
+
+def analyze_cheque_image(cheque_path: str, signature_path: str) -> Dict[str, Any]:
+    cheque_image_raw = cv2.imread(cheque_path)
+    reference_image_raw = cv2.imread(signature_path)
+
+    if cheque_image_raw is None:
+        raise ValueError("Cheque image could not be loaded.")
+    if reference_image_raw is None:
+        raise ValueError("Reference signature image could not be loaded.")
+
+    cheque_bound, boundary_box, boundary_ok = detect_cheque_boundary(cheque_image_raw)
+    corrected, perspective_ok = perspective_correct(cheque_bound if boundary_ok else cheque_image_raw)
+    deskewed = deskew_image(corrected)
+    sharpened = sharp_and_threshold(deskewed)
+
+    ocr_results = run_tesseract(deskewed)
+    ocr_text = ocr_results["text"]
+    ocr_data = ocr_results["data"]
+
+    bank_name = extract_field_from_text(ocr_text, ["bank", "bank name", "financial", "state bank"])
+    payee_name = extract_field_from_text(ocr_text, ["payee", "pay to the order of", "name"])
+    date_value = extract_field_from_text(ocr_text, ["date", "dd", "mm", "yyyy"])
+    cheque_number = extract_field_from_text(ocr_text, ["cheque no", "check no", "chq no", "cheque number", "check number"])
+    amount_number = extract_field_from_text(ocr_text, ["amount", "rs", "inr", "total", "value"])
+    amount_words = extract_field_from_text(ocr_text, ["rupees", "only", "amount in words"])
+    micr_number = extract_field_from_text(ocr_text, ["micr", "m i c r", "routing"])
+
+    sig_region = get_signature_region(deskewed)
+    sig_region_rgb = cv2.cvtColor(sig_region, cv2.COLOR_GRAY2RGB) if len(sig_region.shape) == 2 else sig_region
+    reference_rgb = cv2.cvtColor(reference_image_raw, cv2.COLOR_BGR2RGB)
+    similarity, signature_label = compare_signatures(sig_region_rgb, reference_rgb)
+
+    alteration_regions, alteration_status, annotated_image = detect_alteration_regions(deskewed)
+    annotated_path = build_annotated_image(cheque_path, alteration_regions)
+    annotated_base64 = to_base64(annotated_path) if os.path.exists(annotated_path) else ""
+
+    confidence_scores = []
+    for item in ocr_data.get("conf", []):
+        try:
+            confidence_scores.append(float(item))
+        except (TypeError, ValueError):
+            continue
+    average_conf = round(sum(confidence_scores) / len(confidence_scores), 2) if confidence_scores else 55.0
+
+    amount_verification = compare_amounts(amount_number, amount_words)
+
+    cheque_validity = {
+        "date_status": "APPEARS VALID" if date_value != "Not Detected" else "SUSPICIOUS",
+        "cheque_number_status": "APPEARS VALID" if cheque_number != "Not Detected" else "SUSPICIOUS",
+        "micr_status": "APPEARS VALID" if micr_number != "Not Detected" else "SUSPICIOUS",
+        "amount_status": "APPEARS VALID" if amount_number != "Not Detected" else "SUSPICIOUS",
+        "payee_status": "APPEARS VALID" if payee_name != "Not Detected" else "SUSPICIOUS",
+        "signature_status": "APPEARS VALID" if similarity >= 60 else "SUSPICIOUS",
+        "structure_status": "APPEARS VALID" if boundary_ok else "POTENTIALLY INVALID",
+        "other_anomalies": alteration_status != "No obvious alteration",
+    }
+
+    result = {
+        "analysis_summary": {
+            "perspective_correction_successful": perspective_ok,
+            "deskewing_applied": True,
+            "boundary_detection_successful": boundary_ok,
+            "signature_region_detected": sig_region is not None,
+        },
+        "ocr_fields": {
+            "bank_name": {"value": bank_name, "confidence": round(average_conf, 2)},
+            "payee_name": {"value": payee_name, "confidence": round(average_conf, 2)},
+            "date": {"value": date_value, "confidence": round(average_conf, 2)},
+            "cheque_number": {"value": cheque_number, "confidence": round(average_conf, 2)},
+            "amount_in_numbers": {"value": amount_number, "confidence": round(average_conf, 2)},
+            "amount_in_words": {"value": amount_words, "confidence": round(average_conf, 2)},
+            "micr_number": {"value": micr_number, "confidence": round(average_conf, 2)},
+            "signature_region": {"value": "Detected in signature area", "confidence": round(average_conf, 2)},
+        },
+        "amount_verification": amount_verification,
+        "signature_verification": {
+            "similarity": similarity,
+            "classification": signature_label,
+            "analysis_name": "Reference Signature Similarity Analysis",
+            "note": "This is not a legal signature authentication service."
+        },
+        "alteration_analysis": {
+            "status": alteration_status,
+            "regions": alteration_regions,
+            "annotated_image": annotated_base64,
+        },
+        "cheque_validity": cheque_validity,
+        "bounce_status": {
+            "status": "NOT CONFIRMED",
+            "explanation": "Actual cheque bounce status requires bank or clearing-system verification."
+        },
+        "ocr_summary": {
+            "average_confidence": average_conf,
+            "recognized_text_preview": ocr_text[:300] if ocr_text else "Not Detected"
+        },
+        "risk_score": {},
+        "dashboard": {},
+    }
+
+    risk = calculate_risk_score(result)
+    result["risk_score"] = {
+        "score": risk["score"],
+        "level": risk["level"],
+        "reasons": risk["reasons"],
+    }
+    result["dashboard"] = {
+        "main_result": {
+            "risk_score": f"{risk['score']} / 100",
+            "risk_level": risk["level"],
+            "cheque_status": "SUSPICIOUS" if risk["score"] >= 40 else "APPEARS VALID",
+            "bounce_status": "NOT CONFIRMED",
+            "signature_label": f"{signature_label} — {similarity}%"
+        }
+    }
+    return result

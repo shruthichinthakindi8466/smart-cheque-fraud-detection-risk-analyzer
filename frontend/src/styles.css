@@ -1,0 +1,391 @@
+import { useEffect, useRef, useState } from 'react';
+
+const MAX_BYTES = 10 * 1024 * 1024;
+
+const fileToDataUrl = (file) =>
+  new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(new Error('Failed to read file'));
+    reader.readAsDataURL(file);
+  });
+
+const formatFileSize = (bytes) => {
+  if (!bytes) return '0 KB';
+  const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+  const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), sizes.length - 1);
+  const size = bytes / 1024 ** i;
+  return `${size.toFixed(size >= 10 || i === 0 ? 0 : 1)} ${sizes[i]}`;
+};
+
+const getStatusClass = (value) => {
+  if (!value) return 'status-neutral';
+  const normalized = String(value).toUpperCase();
+  if (normalized.includes('MATCH') || normalized.includes('VALID') || normalized.includes('APPEARS')) return 'status-good';
+  if (normalized.includes('SUSPICIOUS') || normalized.includes('POSSIBLE')) return 'status-warn';
+  if (normalized.includes('INVALID') || normalized.includes('HIGH-RISK') || normalized.includes('MISMATCH')) return 'status-danger';
+  return 'status-neutral';
+};
+
+function App() {
+  const chequeInputRef = useRef(null);
+  const signatureInputRef = useRef(null);
+
+  const [chequeFile, setChequeFile] = useState(null);
+  const [signatureFile, setSignatureFile] = useState(null);
+  const [chequePreview, setChequePreview] = useState('');
+  const [signaturePreview, setSignaturePreview] = useState('');
+  const [isLoading, setIsLoading] = useState(false);
+  const [analysis, setAnalysis] = useState(null);
+
+  useEffect(() => {
+    if (chequeFile) {
+      fileToDataUrl(chequeFile)
+        .then((url) => setChequePreview(url))
+        .catch(() => setChequePreview(''));
+    } else {
+      setChequePreview('');
+    }
+  }, [chequeFile]);
+
+  useEffect(() => {
+    if (signatureFile) {
+      fileToDataUrl(signatureFile)
+        .then((url) => setSignaturePreview(url))
+        .catch(() => setSignaturePreview(''));
+    } else {
+      setSignaturePreview('');
+    }
+  }, [signatureFile]);
+
+  const validateFile = (file, allowedTypes) => {
+    if (!file) return false;
+    if (file.size > MAX_BYTES) {
+      return false;
+    }
+    const ext = `.${file.name.split('.').pop().toLowerCase()}`;
+    return allowedTypes.includes(ext);
+  };
+
+  const handleFileSelect = (event, type) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    if (type === 'cheque') {
+      if (!validateFile(file, ['.jpg', '.jpeg', '.png', '.tif', '.tiff', '.bmp'])) {
+        return;
+      }
+      setChequeFile(file);
+    }
+
+    if (type === 'signature') {
+      if (!validateFile(file, ['.jpg', '.jpeg', '.png'])) {
+        return;
+      }
+      setSignatureFile(file);
+    }
+  };
+
+  const handleDrop = (event, type) => {
+    event.preventDefault();
+    const file = event.dataTransfer.files?.[0];
+    if (!file) return;
+
+    if (type === 'cheque') {
+      if (!validateFile(file, ['.jpg', '.jpeg', '.png', '.tif', '.tiff', '.bmp'])) {
+        return;
+      }
+      setChequeFile(file);
+    }
+
+    if (type === 'signature') {
+      if (!validateFile(file, ['.jpg', '.jpeg', '.png'])) {
+        return;
+      }
+      setSignatureFile(file);
+    }
+  };
+
+  const handleAnalyze = async () => {
+    if (!chequeFile || !signatureFile) return;
+    setIsLoading(true);
+
+    const formData = new FormData();
+    formData.append('cheque_image', chequeFile);
+    formData.append('reference_signature', signatureFile);
+
+    try {
+      const response = await fetch('http://localhost:8000/analyze', {
+        method: 'POST',
+        body: formData,
+      });
+
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.detail || 'Analysis failed');
+      }
+      setAnalysis(data);
+    } catch (error) {
+      console.error(error);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const canAnalyze = Boolean(chequeFile && signatureFile);
+
+  return (
+    <div className="app-shell">
+      <div className="ambient ambient-one" />
+      <div className="ambient ambient-two" />
+
+      <header className="topbar glass">
+        <div className="brand-wrap">
+          <div className="brand-mark">SC</div>
+          <div>
+            <p className="eyebrow">Financial Risk Intelligence</p>
+            <h1>Smart Cheque Fraud Detection</h1>
+          </div>
+        </div>
+      </header>
+
+      <main className="layout">
+        <section className="upload-panel glass">
+          <div className="panel-header">
+            <div>
+              <p className="eyebrow">Document Intake</p>
+              <h2>Cheque Analysis</h2>
+            </div>
+          </div>
+
+          <div className="upload-grid">
+            <div
+              className="upload-box"
+              onDragOver={(e) => e.preventDefault()}
+              onDrop={(e) => handleDrop(e, 'cheque')}
+            >
+              <input
+                ref={chequeInputRef}
+                type="file"
+                accept=".jpg,.jpeg,.png,.tif,.tiff,.bmp"
+                hidden
+                onChange={(e) => handleFileSelect(e, 'cheque')}
+              />
+              {!chequePreview ? (
+                <>
+                  <div className="upload-icon">🧾</div>
+                  <div className="upload-copy">
+                    <strong>Cheque Image</strong>
+                    <span>JPG, JPEG, PNG, TIFF, BMP</span>
+                  </div>
+                  <button type="button" className="secondary-btn" onClick={() => chequeInputRef.current?.click()}>
+                    Choose Cheque Image
+                  </button>
+                </>
+              ) : (
+                <div className="preview-wrap">
+                  <img src={chequePreview} alt="Cheque preview" />
+                  <div className="preview-meta">
+                    <span>{chequeFile?.name}</span>
+                    <small>{formatFileSize(chequeFile?.size || 0)}</small>
+                  </div>
+                  <div className="preview-actions">
+                    <button type="button" className="secondary-btn" onClick={() => chequeInputRef.current?.click()}>
+                      Change
+                    </button>
+                    <button type="button" className="ghost-btn" onClick={() => setChequeFile(null)}>
+                      Remove
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <div
+              className="upload-box"
+              onDragOver={(e) => e.preventDefault()}
+              onDrop={(e) => handleDrop(e, 'signature')}
+            >
+              <input
+                ref={signatureInputRef}
+                type="file"
+                accept=".jpg,.jpeg,.png"
+                hidden
+                onChange={(e) => handleFileSelect(e, 'signature')}
+              />
+              {!signaturePreview ? (
+                <>
+                  <div className="upload-icon">✍️</div>
+                  <div className="upload-copy">
+                    <strong>Reference Signature</strong>
+                    <span>JPG, JPEG, PNG</span>
+                  </div>
+                  <button type="button" className="secondary-btn" onClick={() => signatureInputRef.current?.click()}>
+                    Choose Reference Signature
+                  </button>
+                </>
+              ) : (
+                <div className="preview-wrap">
+                  <img src={signaturePreview} alt="Signature preview" />
+                  <div className="preview-meta">
+                    <span>{signatureFile?.name}</span>
+                  </div>
+                  <div className="preview-actions">
+                    <button type="button" className="secondary-btn" onClick={() => signatureInputRef.current?.click()}>
+                      Change
+                    </button>
+                    <button type="button" className="ghost-btn" onClick={() => setSignatureFile(null)}>
+                      Remove
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+
+          <div className="cta-row">
+            <button
+              type="button"
+              className="primary-btn"
+              onClick={handleAnalyze}
+              disabled={!canAnalyze || isLoading}
+            >
+              {isLoading ? 'Analyzing Cheque…' : 'Analyze Cheque'}
+            </button>
+          </div>
+        </section>
+
+        <section className="dashboard-panel glass">
+          {!analysis ? (
+            <div className="empty-state">
+              <div className="empty-icon">🔒</div>
+              <h3>Awaiting cheque and reference files</h3>
+              <p>Upload both documents to generate a risk evaluation.</p>
+            </div>
+          ) : (
+            <>
+              <div className="result-hero">
+                <div className="hero-stat">
+                  <span>Risk Score</span>
+                  <strong>{analysis.risk_score.score} / 100</strong>
+                </div>
+                <div className="hero-stat">
+                  <span>Risk Level</span>
+                  <strong>{analysis.risk_score.level}</strong>
+                </div>
+                <div className="hero-stat">
+                  <span>Cheque Status</span>
+                  <strong>{analysis.dashboard.main_result.cheque_status}</strong>
+                </div>
+              </div>
+
+              <div className="status-grid">
+                <div className="mini-card">
+                  <span>Bounce Status</span>
+                  <strong>{analysis.bounce_status.status}</strong>
+                  <small>{analysis.bounce_status.explanation}</small>
+                </div>
+                <div className="mini-card">
+                  <span>Signature</span>
+                  <strong>{analysis.signature_verification.classification}</strong>
+                  <small>{analysis.signature_verification.similarity}% similarity</small>
+                </div>
+              </div>
+
+              <div className="detail-grid">
+                <div className="info-card">
+                  <h3>Extracted Fields</h3>
+                  <ul className="field-list">
+                    {Object.entries(analysis.ocr_fields).map(([key, field]) => (
+                      <li key={key}>
+                        <span>{key.replace(/_/g, ' ')}</span>
+                        <div>
+                          <strong>{field.value}</strong>
+                          <small>{field.confidence}% confidence</small>
+                        </div>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+
+                <div className="info-card">
+                  <h3>Amount Verification</h3>
+                  <div className={`status-pill ${getStatusClass(analysis.amount_verification.match_status)}`}>
+                    {analysis.amount_verification.match_status}
+                  </div>
+                  <p>{analysis.amount_verification.detail}</p>
+
+                  <h3 className="section-spacer">Reference Signature Similarity Analysis</h3>
+                  <div className={`status-pill ${getStatusClass(analysis.signature_verification.classification)}`}>
+                    {analysis.signature_verification.classification}
+                  </div>
+                  <p>Signature Similarity: {analysis.signature_verification.similarity}%</p>
+                </div>
+              </div>
+
+              <div className="detail-grid">
+                <div className="info-card">
+                  <h3>Alteration / Forgery Analysis</h3>
+                  <div className={`status-pill ${getStatusClass(analysis.alteration_analysis.status)}`}>
+                    {analysis.alteration_analysis.status}
+                  </div>
+                  {analysis.alteration_analysis.regions.length ? (
+                    <ul className="region-list">
+                      {analysis.alteration_analysis.regions.map((region, index) => (
+                        <li key={`${region.label}-${index}`}>
+                          {region.label} at {region.x}, {region.y}
+                        </li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <p>No suspicious regions flagged.</p>
+                  )}
+                  {analysis.alteration_analysis.annotated_image ? (
+                    <img
+                      className="annotated-image"
+                      src={`data:image/png;base64,${analysis.alteration_analysis.annotated_image}`}
+                      alt="Annotated cheque"
+                    />
+                  ) : null}
+                </div>
+
+                <div className="info-card">
+                  <h3>Cheque Validity</h3>
+                  <ul className="validity-list">
+                    {Object.entries(analysis.cheque_validity).map(([key, value]) => {
+                      if (key === 'other_anomalies') {
+                        return (
+                          <li key={key}>
+                            <span>{key.replace(/_/g, ' ')}</span>
+                            <strong>{String(value)}</strong>
+                          </li>
+                        );
+                      }
+                      return (
+                        <li key={key}>
+                          <span>{key.replace(/_/g, ' ')}</span>
+                          <strong className={getStatusClass(value)}>{value}</strong>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                </div>
+              </div>
+
+              <div className="info-card risk-card">
+                <h3>Risk Reasons</h3>
+                <ul className="reasons-list">
+                  {analysis.risk_score.reasons.map((reason, index) => (
+                    <li key={`${reason}-${index}`}>{reason}</li>
+                  ))}
+                </ul>
+              </div>
+            </>
+          )}
+        </section>
+      </main>
+    </div>
+  );
+}
+
+export default App;
